@@ -1,0 +1,107 @@
+services:
+  postgres-primary:
+    image: postgres:16-alpine
+    container_name: postgres-sfbikeshare-primary
+    hostname: postgres-primary
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB_APP}
+      - POSTGRES_USER=${POSTGRES_USER_APP}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD_APP}
+      - POSTGRES_REPLICATION_USER=${POSTGRES_REPLICATION_USER}
+      - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+    volumes:
+      - ./scripts/01-replication-setup.sh:/docker-entrypoint-initdb.d/01-replication-setup.sh
+      - ./scripts/02-create-replication-slot.sh:/docker-entrypoint-initdb.d/02-create-replication-slot.sh
+      - ../data:/app/data
+      # Descomentar caso queira persistir os dados do servidor primario
+      # - ./primary_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT_APP:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER_APP}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: postgres-sfbikeshare-replica
+    hostname: postgres-replica
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_REPLICATION_USER=${POSTGRES_REPLICATION_USER}
+      - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB_APP}
+      - POSTGRES_USER=${POSTGRES_USER_APP}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD_APP}
+    # Descomentar caso queira persistir os dados da Replica
+    # volumes:
+    # - ./replica_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT_REPLICA:-5433}:5432"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+
+    command: >
+      bash -c "
+        if [ ! -d /var/lib/postgresql/data/base ]; then
+          echo 'Aguardando Primary para iniciar pg_basebackup...'
+          until PGPASSWORD='${POSTGRES_REPLICATION_PASSWORD}' pg_isready -h postgres-primary -U ${POSTGRES_REPLICATION_USER} -d ${POSTGRES_DB_APP}; do
+            sleep 1
+          done
+
+          echo 'Iniciando pg_basebackup do Primary...'
+          
+          # Executa pg_basebackup
+          PGPASSWORD='${POSTGRES_REPLICATION_PASSWORD}' pg_basebackup -h postgres-primary -U ${POSTGRES_REPLICATION_USER} -D /var/lib/postgresql/data -P -R -c fast -S replica_slot_01
+          
+          # Permissões para o usuario postgres
+          chown -R postgres:postgres /var/lib/postgresql/data
+          chmod 700 /var/lib/postgresql/data
+        fi
+        
+        # Inicia o servidor PostgreSQL como o usuario 'postgres'
+        exec su - postgres -c 'postgres -D /var/lib/postgresql/data'
+      "
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER_APP}"]
+      interval: 1m00s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  python-app:
+    image: python:3.12-slim
+    container_name: python-sfbikeshare-app
+    working_dir: /app
+    volumes:
+      - ./src:/app/src
+      - ./sql:/app/sql
+      - ./requirements.txt:/app/requirements.txt
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST_APP=postgres-primary
+      - POSTGRES_PORT_APP=5432
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+    command: >
+      bash -c "
+        echo 'Espera inicial...' &&
+        sleep 10 &&
+        echo 'Instalando dependencias...' &&
+        pip install -r /app/requirements.txt &&
+        echo 'Inicializando banco de dados...' &&
+        python src/init_database.py &&
+        echo 'Inicializacao e carga de dados concluida.'
+        tail -f /dev/null
+      "
+    restart: no

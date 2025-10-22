@@ -1,2 +1,3 @@
 # dataeng-query-opt-replica-base
-PostgreSQL Replica
+
+PostgreSQL Replica - Repositório Base para a Aula.
